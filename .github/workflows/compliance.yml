@@ -2,7 +2,7 @@ on:
   pull_request:
     branches: [ "main" ]
 
-name: Commit
+name: MKMBA Compliance Tests
 jobs:
   compliance-tests:
     name: Lint
