@@ -2,10 +2,8 @@ on:
   pull_request:
     branches: [ "main" ]
 
-name: MKMBA Compliance Tests
 jobs:
   compliance-tests:
-    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
