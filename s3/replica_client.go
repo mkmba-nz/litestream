@@ -3,6 +3,7 @@ package s3
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,12 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 	"golang.org/x/sync/errgroup"
@@ -38,8 +39,8 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 // ReplicaClient is a client for writing snapshots & WAL segments to disk.
 type ReplicaClient struct {
 	mu       sync.Mutex
-	s3       *s3.S3 // s3 service
-	uploader *s3manager.Uploader
+	s3       *s3.Client // s3 service
+	uploader *manager.Uploader
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -87,56 +88,63 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Create new AWS session.
-	config := c.config()
-	if region != "" {
-		config.Region = aws.String(region)
+	// Create new AWS SDK config
+	cfg, err := c.config(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot create aws config: %w", err)
 	}
 
-	sess, err := session.NewSession(config)
-	if err != nil {
-		return fmt.Errorf("cannot create aws session: %w", err)
-	}
-	c.s3 = s3.New(sess)
-	c.uploader = s3manager.NewUploader(sess)
+	// Create new S3 client
+	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if c.Endpoint != "" {
+			o.BaseEndpoint = aws.String(c.Endpoint)
+		}
+		if region != "" {
+			o.Region = region
+		}
+		o.UsePathStyle = c.ForcePathStyle
+	})
+	c.uploader = manager.NewUploader(c.s3)
 	return nil
 }
 
 // config returns the AWS configuration. Uses the default credential chain
 // unless a key/secret are explicitly set.
-func (c *ReplicaClient) config() *aws.Config {
-	config := &aws.Config{}
+func (c *ReplicaClient) config(ctx context.Context) (aws.Config, error) {
+	opts := []func(*config.LoadOptions) error{}
 
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
-	}
-	if c.Endpoint != "" {
-		config.Endpoint = aws.String(c.Endpoint)
-	}
-	if c.ForcePathStyle {
-		config.S3ForcePathStyle = aws.Bool(c.ForcePathStyle)
-	}
-	if c.SkipVerify {
-		config.HTTPClient = &http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			c.AccessKeyID,
+			c.SecretAccessKey,
+			"",
+		)))
 	}
 
-	return config
+	if c.SkipVerify {
+		opts = append(opts, config.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}))
+	}
+
+	return config.LoadDefaultConfig(ctx, opts...)
 }
 
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Connect to US standard region to fetch info.
-	config := c.config()
-	config.Region = aws.String(DefaultRegion)
-	sess, err := session.NewSession(config)
+	cfg, err := c.config(ctx)
 	if err != nil {
 		return "", err
 	}
+	cfg.Region = DefaultRegion
+
+	client := s3.NewFromConfig(cfg)
 
 	// Fetch bucket location, if possible. Must be bucket owner.
 	// This call can return a nil location which means it's in us-east-1.
-	if out, err := s3.New(sess).HeadBucketWithContext(ctx, &s3.HeadBucketInput{
+	if out, err := client.HeadBucket(ctx, &s3.HeadBucketInput{
 		Bucket: aws.String(bucket),
 	}); err != nil {
 		return "", err
@@ -153,23 +161,26 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	}
 
 	var generations []string
-	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(c.Bucket),
 		Prefix:    aws.String(litestream.GenerationsPath(c.Path) + "/"),
 		Delimiter: aws.String("/"),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, prefix := range page.CommonPrefixes {
-			name := path.Base(aws.StringValue(prefix.Prefix))
+			name := path.Base(aws.ToString(prefix.Prefix))
 			if !litestream.IsGenerationName(name) {
 				continue
 			}
 			generations = append(generations, name)
 		}
-		return true
-	}); err != nil {
-		return nil, err
 	}
 
 	return generations, nil
@@ -187,19 +198,22 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 	}
 
 	// Collect all files for the generation.
-	var objIDs []*s3.ObjectIdentifier
-	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
+	var objIDs []types.ObjectIdentifier
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
 		Bucket: aws.String(c.Bucket),
 		Prefix: aws.String(dir),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			objIDs = append(objIDs, &s3.ObjectIdentifier{Key: obj.Key})
+			objIDs = append(objIDs, types.ObjectIdentifier{Key: obj.Key})
 		}
-		return true
-	}); err != nil {
-		return err
 	}
 
 	// Delete all files in batches.
@@ -209,9 +223,9 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 			n = len(objIDs)
 		}
 
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return err
@@ -250,7 +264,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	if _, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 		Body:   rc,
@@ -282,7 +296,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 
-	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 	})
@@ -292,7 +306,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, err
 	}
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.ToInt64(out.ContentLength)))
 
 	return out.Body, nil
 }
@@ -308,9 +322,9 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 
-	out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+	out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 		Bucket: aws.String(c.Bucket),
-		Delete: &s3.Delete{Objects: []*s3.ObjectIdentifier{{Key: &key}}, Quiet: aws.Bool(true)},
+		Delete: &types.Delete{Objects: []types.ObjectIdentifier{{Key: aws.String(key)}}, Quiet: aws.Bool(true)},
 	})
 	if err != nil {
 		return err
@@ -344,7 +358,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	if _, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 		Body:   rc,
@@ -376,7 +390,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
 
-	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 	})
@@ -386,7 +400,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.ToInt64(out.ContentLength)))
 
 	return out.Body, nil
 }
@@ -397,7 +411,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		return err
 	}
 
-	objIDs := make([]*s3.ObjectIdentifier, MaxKeys)
+	objIDs := make([]types.ObjectIdentifier, MaxKeys)
 	for len(a) > 0 {
 		n := MaxKeys
 		if len(a) < n {
@@ -410,13 +424,13 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 			if err != nil {
 				return fmt.Errorf("cannot determine wal segment path: %w", err)
 			}
-			objIDs[i] = &s3.ObjectIdentifier{Key: &key}
+			objIDs[i] = types.ObjectIdentifier{Key: aws.String(key)}
 		}
 
 		// Delete S3 objects in bulk.
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return err
@@ -444,19 +458,22 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	}
 
 	// Collect all files for the generation.
-	var objIDs []*s3.ObjectIdentifier
-	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
+	var objIDs []types.ObjectIdentifier
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
 		Bucket: aws.String(c.Bucket),
 		Prefix: aws.String(prefix),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			objIDs = append(objIDs, &s3.ObjectIdentifier{Key: obj.Key})
+			objIDs = append(objIDs, types.ObjectIdentifier{Key: obj.Key})
 		}
-		return true
-	}); err != nil {
-		return err
 	}
 
 	// Delete all files in batches.
@@ -466,9 +483,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			n = len(objIDs)
 		}
 
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return err
@@ -519,15 +536,21 @@ func (itr *snapshotIterator) fetch() error {
 		return fmt.Errorf("cannot determine snapshots path: %w", err)
 	}
 
-	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
+	paginator := s3.NewListObjectsV2Paginator(itr.client.s3, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(itr.client.Bucket),
 		Prefix:    aws.String(dir + "/"),
 		Delimiter: aws.String("/"),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(itr.ctx)
+		if err != nil {
+			return err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(aws.StringValue(obj.Key))
+			key := path.Base(aws.ToString(obj.Key))
 			index, err := litestream.ParseSnapshotPath(key)
 			if err != nil {
 				continue
@@ -536,7 +559,7 @@ func (itr *snapshotIterator) fetch() error {
 			info := litestream.SnapshotInfo{
 				Generation: itr.generation,
 				Index:      index,
-				Size:       aws.Int64Value(obj.Size),
+				Size:       aws.ToInt64(obj.Size),
 				CreatedAt:  obj.LastModified.UTC(),
 			}
 
@@ -545,8 +568,8 @@ func (itr *snapshotIterator) fetch() error {
 			case itr.ch <- info:
 			}
 		}
-		return true
-	})
+	}
+	return nil
 }
 
 func (itr *snapshotIterator) Close() (err error) {
@@ -622,15 +645,21 @@ func (itr *walSegmentIterator) fetch() error {
 		return fmt.Errorf("cannot determine wal path: %w", err)
 	}
 
-	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
+	paginator := s3.NewListObjectsV2Paginator(itr.client.s3, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(itr.client.Bucket),
 		Prefix:    aws.String(dir + "/"),
 		Delimiter: aws.String("/"),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(itr.ctx)
+		if err != nil {
+			return err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(aws.StringValue(obj.Key))
+			key := path.Base(aws.ToString(obj.Key))
 			index, offset, err := litestream.ParseWALSegmentPath(key)
 			if err != nil {
 				continue
@@ -640,18 +669,18 @@ func (itr *walSegmentIterator) fetch() error {
 				Generation: itr.generation,
 				Index:      index,
 				Offset:     offset,
-				Size:       aws.Int64Value(obj.Size),
+				Size:       aws.ToInt64(obj.Size),
 				CreatedAt:  obj.LastModified.UTC(),
 			}
 
 			select {
 			case <-itr.ctx.Done():
-				return false
+				return nil
 			case itr.ch <- info:
 			}
 		}
-		return true
-	})
+	}
+	return nil
 }
 
 func (itr *walSegmentIterator) Close() (err error) {
@@ -750,12 +779,8 @@ var (
 )
 
 func isNotExists(err error) bool {
-	switch err := err.(type) {
-	case awserr.Error:
-		return err.Code() == `NoSuchKey`
-	default:
-		return false
-	}
+	var noSuchKey *types.NoSuchKey
+	return errors.As(err, &noSuchKey)
 }
 
 func deleteOutputError(out *s3.DeleteObjectsOutput) error {
@@ -763,9 +788,9 @@ func deleteOutputError(out *s3.DeleteObjectsOutput) error {
 	case 0:
 		return nil
 	case 1:
-		return fmt.Errorf("deleting object %s: %s - %s", aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message))
+		return fmt.Errorf("deleting object %s: %s - %s", aws.ToString(out.Errors[0].Key), aws.ToString(out.Errors[0].Code), aws.ToString(out.Errors[0].Message))
 	default:
 		return fmt.Errorf("%d errors occurred deleting objects, %s: %s - (%s (and %d others)",
-			len(out.Errors), aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message), len(out.Errors)-1)
+			len(out.Errors), aws.ToString(out.Errors[0].Key), aws.ToString(out.Errors[0].Code), aws.ToString(out.Errors[0].Message), len(out.Errors)-1)
 	}
 }
