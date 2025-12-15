@@ -1,8 +1,8 @@
 module github.com/benbjohnson/litestream
 
-go 1.23.0
+go 1.24.0
 
-toolchain go1.23.2
+toolchain go1.24.4
 
 require (
 	cloud.google.com/go/storage v1.36.0
@@ -18,9 +18,9 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.21.1
-	golang.org/x/crypto v0.38.0
-	golang.org/x/sync v0.14.0
-	golang.org/x/sys v0.33.0
+	golang.org/x/crypto v0.46.0
+	golang.org/x/sync v0.19.0
+	golang.org/x/sys v0.39.0
 	google.golang.org/api v0.154.0
 	gopkg.in/yaml.v2 v2.4.0
 )
@@ -68,9 +68,9 @@ require (
 	go.opentelemetry.io/otel v1.21.0 // indirect
 	go.opentelemetry.io/otel/metric v1.21.0 // indirect
 	go.opentelemetry.io/otel/trace v1.21.0 // indirect
-	golang.org/x/net v0.40.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect
-	golang.org/x/text v0.25.0 // indirect
+	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect
 	google.golang.org/genproto v0.0.0-20231212172506-995d672761c0 // indirect
