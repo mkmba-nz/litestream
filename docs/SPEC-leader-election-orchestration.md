@@ -597,36 +597,159 @@ This would eliminate the outage window but adds significant complexity.
 
 ---
 
-## 8. Open Questions
+## 8. Review: Lost Writes and Stale Writer Analysis
 
-1. **VFS in main binary vs Hydrator-only**: Should the main `litestream` binary support
+### 8.1 Critical: No Fencing on LTX Writes to S3
+
+The S3 `WriteLTXFile` implementation (`s3/replica_client.go:637-680`) performs a plain
+`PutObject` with no conditional write semantics (`IfMatch`/`IfNoneMatch`). LTX files are
+keyed purely by TXID range (`{path}/{level:04x}/{minTXID:016x}-{maxTXID:016x}.ltx`) with
+no generation or writer ID in the path or metadata.
+
+This means **a stale writer can silently overwrite LTX files written by the new primary**.
+S3 is last-writer-wins; there is no mechanism to reject writes from a writer that no longer
+holds the lease.
+
+**The lease `Generation` field** (`leaser.go:34`) exists but is **only used within
+`lock.json` itself**. It is never propagated to LTX file paths, S3 object metadata, or
+the LTX file content. There is no fencing token pattern in the write path.
+
+### 8.2 Lost Write Scenario: Split-Brain S3 Overwrite
+
+The spec (section 4.7) acknowledges the split-brain risk window but underestimates its
+impact. The dangerous case is not "two primaries writing simultaneously" — it's the
+**demotion shutdown path actively pushing stale data to S3 after the lease is lost**.
+
+```
+Timeline:
+  T=0s   A holds lease, is primary, TXID=100
+  T=5s   Network partition begins (or lease renewal fails for any reason)
+  T=10s  A's renewal fails at TTL/3 check → demotion triggered
+  T=10s  A sends SIGTERM to child process
+  T=11s  Child commits in-flight transaction (TXID 101), then exits
+  T=12s  A's Store.Close() runs "final sync" → uploads TXID 101 to S3
+         This SUCCEEDS (network may have recovered, or was only partially down)
+
+  Meanwhile:
+  T=10s  B acquires expired lease, begins promotion
+  T=12s  B restores from S3 (gets up to TXID 100)
+  T=14s  B's child starts writing → B's first write is also TXID 101
+  T=15s  B uploads its own TXID 101 to S3
+
+  Result: B's TXID 101 overwrites A's TXID 101 (or vice versa, depending on
+          timing). The two files contain DIFFERENT page data for the same TXID.
+          One writer's data is silently lost.
+```
+
+The spec's section 4.4.4 step 4 says: "Close Store (final sync — may fail if lease truly
+lost, that's OK)". The "that's OK" is incorrect. **If the sync succeeds, that's the
+dangerous case** — stale data lands on S3 with no way to distinguish it from legitimate
+writes.
+
+### 8.3 Lost Write Scenario: Partial Network Partition
+
+Network partitions are often asymmetric. Instance A might be able to upload LTX files to
+S3 (data plane works) while failing to renew the lease (control plane is unreachable, or
+the specific `lock.json` key hits a different S3 partition that's affected). This creates
+a window where both A and B are actively writing LTX files to overlapping TXID ranges.
+
+### 8.4 Lost Write Scenario: Slow Child Shutdown During Demotion
+
+Section 4.4.4 specifies SIGTERM → wait → SIGKILL for child shutdown. During the wait:
+- The child is still writing to SQLite (committing in-flight transactions)
+- The DB WAL monitor goroutine is still running
+- The Replica sync goroutine is still uploading LTX files to S3
+
+The demotion path does not stop the Replica sync goroutine **before** sending SIGTERM to
+the child. Writes that commit during the shutdown window get replicated to S3 without any
+lease validation.
+
+### 8.5 VFS Write Path vs Primary Write Path Asymmetry
+
+The VFS write path (`vfs.go:1543-1607`) has a `checkForConflict()` call that compares
+`expectedTXID` against the remote before uploading. This provides some protection (though
+it's a TOCTOU race, not an atomic conditional write).
+
+The **primary DB replication path** (`replica.go:176-194`) has **no equivalent check**. It
+iterates through the TXID range and calls `uploadLTXFile` with no conflict detection.
+This is the path that runs during normal primary operation and during the final sync on
+shutdown.
+
+### 8.6 Recommended Mitigations
+
+**Option A: Generation-prefixed LTX paths (strongest)**
+
+Include the lease generation in the LTX file path:
+```
+{path}/{generation:016x}/{level:04x}/{minTXID:016x}-{maxTXID:016x}.ltx
+```
+Each new primary writes to a new generation namespace. Replicas read from the latest
+generation. Old generations are garbage-collected. This completely eliminates cross-writer
+overwrites but requires changes to `ReplicaClient`, restore logic, and compaction.
+
+**Option B: Conditional writes on LTX upload (moderate)**
+
+Use `IfNoneMatch: "*"` on `PutObject` for L0 LTX files. If the file already exists (another
+writer already wrote that TXID), the upload fails with 412 PreconditionFailed. The stale
+writer detects it has been superseded and stops. This is simpler than Option A but doesn't
+protect against the case where the stale writer uploads first.
+
+**Option C: Stop replication before SIGTERM on demotion (minimum)**
+
+In the demotion path (section 4.4.4), reorder the steps:
+```
+1. Stop lease renewal goroutine
+2. Stop Replica sync goroutine immediately (prevent further S3 uploads)
+3. SIGTERM child process
+4. Wait for child exit
+5. Do NOT run final sync (we don't hold the lease; any sync is dangerous)
+6. Enter REPLICA mode
+```
+This is the minimum viable fix. It narrows the window but doesn't fully close it because
+the child could still commit transactions that the WAL monitor picks up and queues for
+sync before the sync goroutine is stopped.
+
+**Recommended approach**: Combine Options A and C. Use generation-prefixed paths to make
+cross-writer overwrites impossible, and stop replication before child shutdown to minimize
+unnecessary writes during demotion.
+
+---
+
+## 9. Open Questions
+
+1. **LTX write fencing**: Given the analysis in section 8, what level of protection is
+   acceptable? Generation-prefixed paths (Option A) are the safest but most invasive.
+   Conditional writes (Option B) are a good middle ground. Stopping replication before
+   SIGTERM (Option C) is the minimum. This should be decided before implementation begins.
+
+2. **VFS in main binary vs Hydrator-only**: Should the main `litestream` binary support
    VFS registration (requires CGo), or should replica mode exclusively use the Hydrator
    to maintain a local file? The Hydrator-only approach is simpler and keeps the binary
    pure-Go, but means the child process reads a file that is being written to by another
    goroutine (though SQLite WAL mode with `PRAGMA query_only=1` handles this safely as
    long as both sides use SQLite's locking protocol).
 
-2. **Hydrator file safety**: The Hydrator writes pages with raw `WriteAt()` calls,
+3. **Hydrator file safety**: The Hydrator writes pages with raw `WriteAt()` calls,
    bypassing SQLite's locking. Need to verify that a child process reading the same file
    via standard SQLite won't see torn pages or inconsistent state. Options:
    - Write to temp file, atomic rename (safe but causes brief connection drop)
    - Use SQLite backup API instead of raw page writes (safe, respects locking)
    - Accept the risk (4KB page writes are typically atomic on Linux ext4/xfs)
 
-3. **Lease TTL vs poll interval**: The default lease TTL is 30s and the VFS poll interval
+4. **Lease TTL vs poll interval**: The default lease TTL is 30s and the VFS poll interval
    is 1s. During promotion, the new primary's first write needs to land in S3 before any
    remaining replicas poll for updates. Is there a race condition if the old primary's
    last writes and new primary's first writes create overlapping LTX TXID ranges?
    The LTX format's TXID ordering should prevent this, but needs verification.
 
-4. **Multiple databases**: The current design assumes one database. If `dbs:` contains
+5. **Multiple databases**: The current design assumes one database. If `dbs:` contains
    multiple databases, should the lease cover all of them (single primary for all DBs)
    or should each DB have its own lease? Single lease is simpler and correct for most
    use cases.
 
 ---
 
-## 9. References
+## 10. References
 
 - Litestream upstream: https://github.com/benbjohnson/litestream (commit c32f6c8)
 - S3 Leaser: `s3/leaser.go`, `s3/leaser_test.go`
